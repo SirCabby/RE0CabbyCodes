@@ -1,0 +1,9 @@
+# Copy this file to config.mk and set your local path.
+#   cp config.mk.example config.mk
+# config.mk is gitignored, so your personal values never enter the repo.
+
+# Absolute path to your Resident Evil 0 folder (the directory containing "re0hd.exe").
+# The path contains spaces; that is fine - do not quote it here.
+# Windows example:      GAME_DIR := C:/Program Files (x86)/Steam/steamapps/common/Resident Evil 0
+# Linux/Proton example: GAME_DIR := /home/you/.local/share/Steam/steamapps/common/Resident Evil 0
+GAME_DIR := /path/to/your/Resident Evil 0
