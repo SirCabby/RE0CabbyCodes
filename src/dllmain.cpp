@@ -86,7 +86,7 @@ DWORD WINAPI mod_thread(LPVOID) {
 
 }  // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
   using namespace re0cc;
   switch (reason) {
     case DLL_PROCESS_ATTACH: {
@@ -120,9 +120,19 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       break;
     }
     case DLL_PROCESS_DETACH:
-      // Undo every patch before this image goes away: anything still pointing
-      // into the DLL would fault the moment the game touched it during its own
-      // teardown.
+      // `reserved` is non-null when the whole process is terminating (rather
+      // than a FreeLibrary). By then Windows has already ended every other
+      // thread, and this runs under the loader lock, so touching the window, the
+      // Direct3D device or ImGui here is unsafe: it hung/crashed the game on
+      // close - and releasing D3D objects during teardown could wedge the GPU
+      // driver, which is what "hangs the machine until a restart" looks like.
+      // The OS reclaims all of it, so on a real exit do nothing. A statically
+      // imported proxy is never FreeLibrary'd in practice, so the revert path is
+      // only for completeness (and only reached with the process still alive).
+      if (reserved) {
+        logf("process exiting - leaving hooks for the OS to reclaim");
+        break;
+      }
       logf("unloading - removing hooks");
       dispatch::uninstall();
       cheats::remove_hooks();

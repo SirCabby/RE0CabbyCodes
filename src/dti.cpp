@@ -378,19 +378,75 @@ uintptr_t slot_from_newinstance(const ClassInfo& c, uintptr_t* ni_out) {
   return 0;
 }
 
+// Some singletons are not built through newInstance at all: sItem's newInstance
+// is a `xor eax,eax; ret` stub, and the object is constructed elsewhere. With no
+// static slot found above, find_singleton used to fall through to the heap scan,
+// which matches any dword equal to the vtable - and on Windows that caught a
+// coincidental match (a spot in a DTI table, not a real object) and cached it
+// with no slot to re-read, so the inventory read garbage for the whole session
+// ("inventory not found"). The constructor, though, both stores the class vtable
+// into the object (`mov [reg], <vtable>`) and the object pointer into the class's
+// static slot (`mov [abs], reg`) a few bytes apart. That pairing gives the slot
+// directly, so the singleton resolves off a slot the game keeps current - the
+// same way sGameInfo/sSaveManager already do - instead of a one-shot heap guess.
+uintptr_t slot_from_ctor(const ClassInfo& c) {
+  if (!c.vtable) return 0;
+  const mem::Range text = image::text();
+  uintptr_t slot = 0;
+  bool ambiguous = false;
+  for (uintptr_t a : mem::find_all(text, mem::imm32_pattern(static_cast<uint32_t>(c.vtable)), 64)) {
+    // `C7 /0 imm32` storing the vtable into [reg] at offset 0: opcode C7, modrm
+    // mod=00 reg=000 rm=reg, with rm != 4 (SIB) and != 5 (disp32-only).
+    if (a < text.begin + 2) continue;
+    if (mem::read<uint8_t>(a - 2) != 0xC7) continue;
+    const uint8_t modrm = mem::read<uint8_t>(a - 1);
+    if ((modrm >> 6) != 0 || ((modrm >> 3) & 7) != 0) continue;
+    const int reg = modrm & 7;
+    if (reg == 4 || reg == 5) continue;
+    // A `mov [abs], reg` into .data close to the vtable store: `A3 abs` for eax,
+    // else `89 /r` with mod=00 rm=101 (disp32) and the reg field == reg.
+    const uintptr_t w0 = a > text.begin + 0x40 ? a - 0x40 : text.begin;
+    const uintptr_t w1 = a + 0x40 < text.end - 6 ? a + 0x40 : text.end - 6;
+    for (uintptr_t p = w0; p < w1; ++p) {
+      uintptr_t abs = 0;
+      if (reg == 0 && mem::read<uint8_t>(p) == 0xA3) {
+        abs = mem::read<uint32_t>(p + 1);
+      } else if (mem::read<uint8_t>(p) == 0x89) {
+        const uint8_t mb = mem::read<uint8_t>(p + 1);
+        if ((mb >> 6) != 0 || (mb & 7) != 5 || static_cast<int>((mb >> 3) & 7) != reg) continue;
+        abs = mem::read<uint32_t>(p + 2);
+      } else {
+        continue;
+      }
+      if (!image::data().contains(abs)) continue;
+      if (slot && slot != abs) ambiguous = true;
+      else slot = abs;
+    }
+  }
+  if (ambiguous) {
+    logf("dti: %s: the constructor points at more than one static slot - not using it", c.name);
+    return 0;
+  }
+  return slot;
+}
+
 bool find_singleton(const ClassInfo& c, Singleton* out) {
   if (!c.vtable) return false;
   uintptr_t ni = 0;
-  if (const uintptr_t slot = slot_from_newinstance(c, &ni)) {
+  uintptr_t slot = slot_from_newinstance(c, &ni);
+  char via[64];
+  if (slot) std::snprintf(via, sizeof(via), "newInstance exe+0x%06X", image::rva(ni));
+  if (!slot && (slot = slot_from_ctor(c))) std::snprintf(via, sizeof(via), "its constructor");
+  if (slot) {
     uint32_t cur = 0, vt = 0;
     mem::read_safe(slot, &cur);
     if (cur && (!mem::read_safe(cur, &vt) || vt != c.vtable)) {
-      logf("dti: %s: newInstance exe+0x%06X stores to exe+0x%06X but it holds %08X (vtable %08X, not %s) - ignoring that slot",
-           c.name, image::rva(ni), image::rva(slot), cur, vt, c.name);
+      logf("dti: %s: %s stores to exe+0x%06X but it holds %08X (vtable %08X, not %s) - ignoring that slot",
+           c.name, via, image::rva(slot), cur, vt, c.name);
     } else {
       out->slot = slot;
       out->obj = cur;
-      logf("dti: %s static slot exe+0x%06X (from newInstance exe+0x%06X)%s", c.name, image::rva(slot), image::rva(ni),
+      logf("dti: %s static slot exe+0x%06X (from %s)%s", c.name, image::rva(slot), via,
            cur ? "" : " - object not created yet");
       return true;
     }

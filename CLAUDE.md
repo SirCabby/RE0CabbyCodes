@@ -96,8 +96,12 @@ vtable** (entry 1 = `newInstance`), `+4` name, `+8` next, `+C` child, `+0x10` pa
 with the top bit set (`uPlayerRebecca` 0x80000002, `uPlayerBilly` 0x80000005). Every `MtObject`
 vtable's slot **4** is `getDTI()` = `B8 <dti> C3`; the class vtable base is that slot − 16
 (constructor stores prove it). Singletons: `newInstance` (or the constructor it calls) stores the
-object into a static slot, `mov [slot], reg` — `dti::find_singleton` parses that, falls back to a
-`.data` scan for a pointer to an object with the vtable, then a heap scan (own stack excluded).
+object into a static slot, `mov [slot], reg` — `dti::find_singleton` parses that; failing that
+(`sItem`'s `newInstance` is a `xor eax,eax; ret` stub — the object is built elsewhere) it reads the
+slot from the **constructor** instead (`slot_from_ctor`: the `C7 /0 mov [reg],<vtable>` that stores
+the class vtable and a `mov [abs],reg` — `A3` / `89 /r` mod=00 rm=101 — into `.data` a few bytes
+apart), then falls back to a `.data` scan for a pointer to an object with the vtable, then a heap
+scan (own stack excluded).
 A `newInstance` with nothing left to do reaches its constructor by a **tail `jmp`**, not a call, so
 the follow-the-callee step takes `E9` as well as `E8`; that is what turns `sEnemy`, `sGameInfo`,
 `sSaveManager`, `sSubMenu`, `sGameChara` and `sEventScript` from scan hits into slots read out of the
@@ -616,6 +620,23 @@ row (exe+0x8D5B9C -> exe+0x17A9D0, see Typewriter and ink ribbons).
 - A heap scan for a vtable value finds its own argument on the calling thread's stack first; the
   first launch cached that bogus hit for six singletons. `mem::find_objects_by_vtable` now skips the
   current stack and the scan buffer, and singletons are re-resolved on every use.
+- **The heap scan also matches a coincidental dword, not only a real object, and a heap-found
+  singleton has no slot to re-read - so a wrong hit is cached for the whole session.** On Windows
+  (2026-09-25, "infinite ammo says inventory not found") `sItem` fell to the heap scan and cached a
+  spot *inside a DTI table* whose dword equalled the sItem vtable; `read_bag` rejected the garbage at
+  `+0x20` every tick. It only bit Windows because sItem has no `newInstance` (a `xor eax,eax; ret`
+  stub) and there the heap scan won the race against the `.data` pointer-scan that caught the real
+  slot on Linux. Fix: derive the slot from the constructor's vtable-store + `.data` store
+  (`slot_from_ctor`, above) so sItem resolves off a slot the game keeps current, like every other
+  singleton. Prefer a static slot over a heap hit; a heap hit is a last resort and self-corrects for
+  nothing.
+- **Do nothing in `DLL_PROCESS_DETACH` when the process is terminating** (`reserved != NULL`). On
+  Windows the game hung or crashed on close (Event Log AppHangTransient; the mod log stopped after
+  "unloading - removing hooks" with no "hooks removed cleanly", and it could wedge the GPU driver into
+  a machine-hang). By then Windows has ended every other thread and DllMain holds the loader lock, so
+  restoring the wndproc, releasing the D3D9 device and shutting ImGui down there is unsafe. The hooks
+  and byte patches live only in the process's own memory (the exe is never patched on disk), so the OS
+  reclaims them; only a real `FreeLibrary` (never happens for a static-import proxy) needs the revert.
 - The DTI id is not always a CRC: `uPlayer*` classes carry explicit ids (top bit set).
 - `sInGameSystem`'s constructor sits right after `sGameInfo::updateTime` in `.text`, which made it
   look like the clock's owner; the live data (save count 0→1 on a save, +0x3C at 29.2/s) says
